@@ -19,7 +19,7 @@ namespace Jitting
         /// Will skip jitting for methods where generic constraints cannot be satisfied.
         /// </summary>
         /// <param name="assembliesToJitFilter">Limits jitting to assemblies that satisfy this predicate.</param>
-        /// <param name="throwOnError">If true, exception will be shown if any of the methods fail while jitting.</param>
+        /// <param name="throwOnError">If true, exception will be thrown when any of the methods fail while jitting.</param>
         /// <param name="logger">Optional logger to write jitting summary to.</param>
         public static void RunJitting(Func<Assembly, bool> assembliesToJitFilter, bool throwOnError = true, ILogger? logger = null)
         {
