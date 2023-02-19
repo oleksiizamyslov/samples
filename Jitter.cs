@@ -390,19 +390,23 @@ namespace Jitting
             Assembly assembly,
             HashSet<Assembly> loadedAssemblies)
         {
-            var alreadyLoaded = !loadedAssemblies.Add(assembly);
-            if (alreadyLoaded)
-                return;
-
             var referencedAssemblies = assembly.GetReferencedAssemblies();
-
-            foreach (var curAssemblyName in referencedAssemblies)
+    
+            foreach (var refAssemblyName in referencedAssemblies)
             {
-                var nextAssembly = Assembly.Load(curAssemblyName);
-                if (nextAssembly.GlobalAssemblyCache)
+                var refAssembly = Assembly.Load(refAssemblyName);
+                
+                var alreadyLoaded = !loadedAssemblies.Add(refAssembly);
+                if (alreadyLoaded)
                     continue;
 
-                ForceLoadAll(nextAssembly, loadedAssemblies);
+                if (refAssembly.GlobalAssemblyCache)
+                    continue;
+
+                Assembly.LoadFile(refAssembly.Location);
+                loadedAssemblies.Add(refAssembly);
+                
+                ForceLoadAll(refAssembly, loadedAssemblies);
             }
         }
 
