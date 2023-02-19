@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -8,10 +9,10 @@ using Microsoft.Extensions.Logging;
 
 namespace Jitting
 {
-    public static class Jitter
+    public class Jitter
     {
         private const int TypeSamplesLimit = 100;
-
+        
         /// <summary>
         /// Loads all assemblies references by application into memory and forces JIT compilation for
         /// all assemblies that satisfy assembliesToJitFilter filter.
@@ -21,19 +22,22 @@ namespace Jitting
         /// <param name="assembliesToJitFilter">Limits jitting to assemblies that satisfy this predicate</param>
         /// <param name="throwOnError">If true, exception will be thrown when jitting fails for any of the methods</param>
         /// <param name="logger">Optional logger to write jitting summary to</param>
-        public static void RunJitting(Func<Assembly, bool> assembliesToJitFilter, bool throwOnError = true, ILogger? logger = null)
+        public static void RunJitting(Func<Assembly, bool> assembliesToJitFilter, ILogger? logger = null, bool throwOnError = true)
         {
-            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-            var set = new HashSet<Assembly>(assemblies);
-            foreach (var a in assemblies)
+            var sw = Stopwatch.StartNew();
+            var initialAssemblies = AppDomain.CurrentDomain.GetAssemblies();
+            var set = new HashSet<Assembly>(initialAssemblies);
+            var failedAsms = new HashSet<(Assembly, AssemblyName)>();
+            foreach (var asm in initialAssemblies)
             {
-                ForceLoadAll(a, set);
+                ForceLoadAll(asm, failedAsms, set);
             }
-
+            
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
             var types = assemblies.Where(p => !p.FullName.Contains("CoreLib")).SelectMany(GetAllRelevantTypes).ToArray();
             var generics = FindGenerics(types);
+            var relevantAssemblies = assemblies.Where(assembliesToJitFilter).ToArray();
             
-            var relevantAssemblies = set.Where(assembliesToJitFilter).ToArray();
             logger?.LogInformation($"Jitting {relevantAssemblies.Length} assemblies...");
             var results = new List<JitResult>();
             foreach (var asm in relevantAssemblies)
@@ -41,27 +45,45 @@ namespace Jitting
                 var res = PreJitMethods(asm, types, generics, logger);
                 results.AddRange(res.ToArray());
             }
-
-            FinalizeResults(results, logger, throwOnError);
+    
+            sw.Stop();
+            FinalizeResults(sw.Elapsed, results, failedAsms, logger, throwOnError);
         }
-
-        private static void FinalizeResults(List<JitResult> results, ILogger? logger, bool throwOnerror)
+    
+        private static void FinalizeResults(
+            TimeSpan swElapsed,
+            List<JitResult> results,
+            HashSet<(Assembly, AssemblyName)> failedAssemblies,
+            ILogger? logger,
+            bool throwOnerror)
         {
+            if (failedAssemblies.Any())
+            {
+                foreach (var asmName in failedAssemblies)
+                {
+                    logger.LogError($"{asmName.Item2} failed to load (referenced by {asmName.Item1.FullName}).");
+                }
+            }
+            
             var counts = results.GroupBy(p => p.Outcome).ToDictionary(p => p.Key, p => p.Count());
             counts.TryGetValue(JitOutcome.Fail, out var fail);
             counts.TryGetValue(JitOutcome.Success, out var success);
             counts.TryGetValue(JitOutcome.Skip, out var skip);
-
-            var logLevel = fail > 0 ? LogLevel.Error : skip > 0 ? LogLevel.Warning : LogLevel.Information;
-          
-            logger?.Log(logLevel, $"Jitting completed! {success} methods jitted successfully, {fail} failures, {skip} skipped");
-
-            if (fail > 0 && throwOnerror)
+            
+            if (fail > 0 || failedAssemblies.Any())
             {
-                throw new InvalidOperationException($"JIT failed for {fail} methods");
+                logger?.LogError($"Jitting completed in {swElapsed.TotalSeconds} seconds. {success} methods jitted successfully, {fail} failures, {skip} skipped, {failedAssemblies.Count} assemblies failed to load.");
+            }
+            else if (skip > 0)
+            {
+                logger?.LogInformation($"Jitting completed in {swElapsed.TotalSeconds} seconds! {success} methods jitted successfully, {skip} skipped");
+            }
+            if ((failedAssemblies.Any() || fail > 0) && throwOnerror)
+            {
+                throw new InvalidOperationException($"JIT failed for {fail} methods, {failedAssemblies.Count} assemblies failed to load.");
             }
         }
-
+    
         private static JitResult[] PreJitMethods(
             Assembly assembly,
             Type[] allTypes,
@@ -70,22 +92,22 @@ namespace Jitting
         {
             List<JitResult> res = new List<JitResult>();
             Type[] types = GetAllRelevantTypes(assembly);
-
+    
             foreach (Type curType in types)
             {
                 MethodInfo[] methods = curType.GetMethods(
                     BindingFlags.DeclaredOnly | BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static);
-
+    
                 foreach (MethodInfo curMethod in methods)
                 {
                     if (curMethod.IsAbstract || curMethod.Name.Contains("RuntimeMethodInfo"))
                         continue;
-
+    
                     var result = JitMethod(curMethod, allTypes, genericImplementations);
                     res.Add(result);
                 }
             }
-
+    
             var errors = res.Where(p => p.Outcome == JitOutcome.Fail).ToArray();
             var i = 0;
             if (errors.Any())
@@ -96,13 +118,13 @@ namespace Jitting
                 {
                     sb.AppendLine($"\t{++i}. {outcome.MethodInfo.DeclaringType}.{outcome.MethodInfo.Name}: {outcome.Exception?.Message}");
                 }
-
+    
                 logger?.LogError(sb.ToString());
             }
-
+    
             return res.ToArray();
         }
-
+    
         private static JitResult JitMethod(
             MethodInfo method,
             Type[] allTypes, Dictionary<Type, List<Type>> genericImplementations)
@@ -120,7 +142,7 @@ namespace Jitting
                     {
                         return new JitResult(JitOutcome.Skip, method);
                     }
-
+    
                     RuntimeHelpers.PrepareMethod(method.MethodHandle, substitutes.Select(p => p.TypeHandle).ToArray());
                 }
                 else
@@ -136,81 +158,81 @@ namespace Jitting
             {
                 return new JitResult(JitOutcome.Fail, method, ex);
             }
-
+    
             return new JitResult(JitOutcome.Success, method);
         }
-
+    
         private static Type[] GetGenericArgumentSubstitutes(MethodInfo curMethod, Type[] allTypes, Dictionary<Type, List<Type>> genericImplementations)
         {
             var declaringType = curMethod.DeclaringType;
             var typeParameters = declaringType!.GetGenericArguments();
             var typeSubstitutes = GetSubstitutes(typeParameters, allTypes, genericImplementations);
-
+    
             var methodParameters = curMethod.GetGenericArguments();
             var methodSubstitutes = GetSubstitutes(methodParameters, allTypes, genericImplementations);
-
+    
             return typeSubstitutes.Concat(methodSubstitutes).ToArray();
         }
-
+    
         // ReSharper disable once CognitiveComplexity
         private static Type[] GetSubstitutes(Type[] genericParams, Type[] allTypes, Dictionary<Type, List<Type>> genericImplementations)
         {
             var mapping = new Dictionary<Type, Type[]>();
             var paramsToProcess = new List<Type>(genericParams);
             var processedInOrder = new List<Type>();
-
+    
             while (paramsToProcess.Any())
             {
                 var selfReferential = false;
                 var firstToProcess = paramsToProcess.FirstOrDefault(p =>
-                    p.GetGenericParameterConstraints().All(x =>
-                        x.GetGenericArguments().All(a =>
-                        {
-                            if (a == p)
-                            {
-                                selfReferential = true;
-                                return true;
-                            }
-
-                            return mapping.ContainsKey(a) || !genericParams.Contains(a);
-                        })));
+                                                                        p.GetGenericParameterConstraints().All(x =>
+                                                                                                                   x.GetGenericArguments().All(a =>
+                                                                                                                   {
+                                                                                                                       if (a == p)
+                                                                                                                       {
+                                                                                                                           selfReferential = true;
+                                                                                                                           return true;
+                                                                                                                       }
+    
+                                                                                                                       return mapping.ContainsKey(a) || !genericParams.Contains(a);
+                                                                                                                   })));
                 if (selfReferential)
                 {
                     throw new SkipJittingException("Self-referential template constraints not supported");
                 }
-
+    
                 if (firstToProcess == null)
                 {
                     throw new SkipJittingException("Unable to map substitutes.");
                 }
-
+    
                 var satisfyingTypes = GetSatisfyingTypes(firstToProcess, mapping, allTypes, genericImplementations).Take(TypeSamplesLimit).ToArray();
                 if (satisfyingTypes.Length == 0)
                 {
                     throw new SkipJittingException($"Cannot find satisfying type for generic parameter {firstToProcess.Name}.");
                 }
-
+    
                 mapping.Add(firstToProcess, satisfyingTypes.ToArray());
                 paramsToProcess.Remove(firstToProcess);
                 processedInOrder.Add(firstToProcess);
             }
-
+    
             var ret = FinalizeSubstitutes(genericParams, processedInOrder, mapping);
             return ret;
         }
-
+    
         private static IEnumerable<Type> GetSatisfyingTypes(Type genericParam, Dictionary<Type, Type[]> mapping, Type[] allTypes, Dictionary<Type, List<Type>> genericImplementations)
         {
             var typeConstraints = genericParam.GetGenericParameterConstraints().Where(p => p != typeof(ValueType)).ToArray();
             var a = genericParam.GenericParameterAttributes;
-
+    
             var types = GetSatisfyingTypeConstraints(typeConstraints, mapping, allTypes, genericImplementations);
-
+    
             types = types.Where(p => IsSatisfyingAttributes(a, p));
-
+    
             return types;
         }
-
+    
         private static IEnumerable<Type> GetSatisfyingTypeConstraints(Type[] constraint, Dictionary<Type, Type[]> mapping, Type[] allTypes, Dictionary<Type, List<Type>> genericImplementations)
         {
             IEnumerable<Type> res = allTypes.Where(p => !p.IsGenericType);
@@ -228,31 +250,31 @@ namespace Jitting
                         var implementing = genericImplementations[generic];
                         res = res.Intersect(implementing);
                     }
-                
+                    
                     var constraintTypes = GetActualConstraintTypes(c, mapping);
-
+    
                     res = res.Where(p => constraintTypes.Any(cc => cc.IsAssignableFrom(p)));
                 }
             }
-
+    
             return res;
         }
-
+    
         private static IEnumerable<Type> GetActualConstraintTypes(Type constraintType, Dictionary<Type, Type[]> genericMapping)
         {
             if (constraintType.IsGenericType)
             {
                 var @params = constraintType.GetGenericArguments();
                 var substitutes = @params.Select(p => genericMapping.ContainsKey(p)
-                    ? genericMapping[p]
-                    : new[] { p }).ToArray();
+                                                     ? genericMapping[p]
+                                                     : new[] { p }).ToArray();
                 var @base = constraintType.GetGenericTypeDefinition();
                 return CrossJoin(@base, substitutes);
             }
-
+    
             return new[] { constraintType };
         }
-
+    
         // ReSharper disable once CognitiveComplexity
         private static bool IsSatisfyingAttributes(GenericParameterAttributes genericParameterAttributes, Type t)
         {
@@ -263,7 +285,7 @@ namespace Jitting
                     return false;
                 }
             }
-
+    
             if ((genericParameterAttributes & GenericParameterAttributes.NotNullableValueTypeConstraint) == GenericParameterAttributes.NotNullableValueTypeConstraint)
             {
                 if (!t.IsValueType || IsNullable(t))
@@ -271,7 +293,7 @@ namespace Jitting
                     return false;
                 }
             }
-
+    
             else if ((genericParameterAttributes & GenericParameterAttributes.DefaultConstructorConstraint)
                      == GenericParameterAttributes
                          .DefaultConstructorConstraint)
@@ -282,28 +304,28 @@ namespace Jitting
                     return false;
                 }
             }
-
+    
             return true;
         }
-
+    
         private static Type[] FinalizeSubstitutes(Type[] genericParams, List<Type> processedInOrder, Dictionary<Type, Type[]> mapping)
         {
             var finalizedMapping = new Dictionary<Type, Type>();
-
+    
             foreach (var parameter in processedInOrder)
             {
                 var substitute = mapping[parameter];
                 finalizedMapping[parameter] = substitute[0];
-
+    
                 var constraints = parameter.GetGenericParameterConstraints();
-
+    
                 ApplyResolvedConstraints(constraints, substitute[0], finalizedMapping);
             }
-
+    
             var selectedSubstitutes = genericParams.Select(p => finalizedMapping[p]).ToArray();
             return selectedSubstitutes;
         }
-
+    
         private static void ApplyResolvedConstraints(Type[] constraints, Type substitute, Dictionary<Type, Type> finalizedMapping)
         {
             foreach (var c in constraints)
@@ -330,10 +352,10 @@ namespace Jitting
                         {
                             implementation = implementation.BaseType!;
                         }
-
+    
                         resolvedArguments = implementation.GetGenericArguments();
                     }
-
+    
                     for (var i = 0; i < argumentNames.Length; ++i)
                     {
                         finalizedMapping[argumentNames[i]] = resolvedArguments[i];
@@ -341,13 +363,13 @@ namespace Jitting
                 }
             }
         }
-
+    
         // ReSharper disable once UnusedParameter.Local
         private static bool IsNullable<T>(T value)
         {
             return Nullable.GetUnderlyingType(typeof(T)) != null;
         }
-
+    
         private static IEnumerable<Type> CrossJoin(Type @base, Type[][] substitutes)
         {
             var indices = substitutes.Select(_ => 0).ToArray();
@@ -358,7 +380,7 @@ namespace Jitting
                 yield return @base.MakeGenericType(substitutes.Select((p, i) => p[indices[i]]).ToArray());
             }
         }
-
+    
         private static bool Increment(int[] indices, int[] maxIndices)
         {
             for (var i = indices.Length - 1; i >= 0; --i)
@@ -371,45 +393,58 @@ namespace Jitting
                     {
                         indices[j] = 0;
                     }
-
+    
                     return true;
                 }
             }
-
+    
             return false;
         }
-
+    
         private static Type[] GetAllRelevantTypes(Assembly assembly)
         {
             var types = assembly.GetTypes().ToArray();
-
+    
             return types;
         }
-
+    
         private static void ForceLoadAll(
             Assembly assembly,
+            HashSet<(Assembly, AssemblyName)> failedLoadAssemblies,
             HashSet<Assembly> loadedAssemblies)
         {
+            if (assembly.FullName.StartsWith("mscorlib,") || assembly.FullName.StartsWith("System,"))
+            {
+                return;
+            }
+            
             var referencedAssemblies = assembly.GetReferencedAssemblies();
     
             foreach (var refAssemblyName in referencedAssemblies)
             {
-                var refAssembly = Assembly.Load(refAssemblyName);
-                
+                Assembly? refAssembly;
+                try
+                {
+                    refAssembly = Assembly.Load(refAssemblyName);
+                }
+                catch
+                {
+                    failedLoadAssemblies.Add((assembly, refAssemblyName));
+                    continue;
+                }
+
                 var alreadyLoaded = !loadedAssemblies.Add(refAssembly);
                 if (alreadyLoaded)
                     continue;
+                loadedAssemblies.Add(refAssembly);
 
                 if (refAssembly.GlobalAssemblyCache)
                     continue;
-
-                Assembly.LoadFile(refAssembly.Location);
-                loadedAssemblies.Add(refAssembly);
                 
-                ForceLoadAll(refAssembly, loadedAssemblies);
+                ForceLoadAll(refAssembly, failedLoadAssemblies, loadedAssemblies);
             }
         }
-
+    
         private static Dictionary<Type, List<Type>> FindGenerics(Type[] types)
         {
             Dictionary<Type, List<Type>> ret = new Dictionary<Type, List<Type>>();
@@ -427,10 +462,10 @@ namespace Jitting
                         }
                         ret[gen].Add(t);
                     }
-
+    
                     b = b.BaseType;
                 }
-
+    
                 var ints = t.GetInterfaces().Where(p => p.IsGenericType);
                 foreach (var i in ints)
                 {
@@ -442,18 +477,18 @@ namespace Jitting
                     ret[gen].Add(t);
                 }
             }
-
+    
             return ret;
         }
-
+    
         private class SkipJittingException:Exception
         {
             public SkipJittingException(string message) : base(message)
             {
-            
+                
             }
         }
-
+    
         private class JitResult
         {
             public JitResult(JitOutcome outcome, MethodInfo methodInfo, Exception? exception = null)
@@ -462,17 +497,17 @@ namespace Jitting
                 MethodInfo = methodInfo;
                 Exception = exception;
             }
-
+    
             public JitOutcome Outcome { get; }
             public MethodInfo MethodInfo { get; }
             public Exception? Exception { get; }
         }
-
+    
         private enum JitOutcome
         {
             Fail = 0,
             Skip = 1,
             Success = 2
-        }
+        }   
     }
 }
