@@ -63,7 +63,7 @@ namespace Jitting
             {
                 foreach (var asmName in failedAssemblies)
                 {
-                    logger.LogError($"{asmName.Item2} failed to load (referenced by {asmName.Item1.FullName}).");
+                    logger?.LogError($"{asmName.Item2} failed to load (referenced by {asmName.Item1.FullName}).");
                 }
             }
 
