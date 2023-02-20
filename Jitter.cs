@@ -18,6 +18,8 @@ namespace Jitting
         /// all assemblies that satisfy assembliesToJitFilter filter.
         /// Tries to JIT generic methods as well, by finding types satisfying the generic constraints.
         /// Will skip jitting for methods where generic constraints cannot be satisfied.
+        ///
+        /// Jitting of generic methods with some complex constraints is not yet supported, such methods will be skipped.
         /// </summary>
         /// <param name="assembliesToJitFilter">Limits jitting to assemblies that satisfy this predicate</param>
         /// <param name="throwOnError">If true, exception will be thrown when jitting fails for any of the methods</param>
@@ -139,7 +141,7 @@ namespace Jitting
                     {
                         substitutes = GetGenericArgumentSubstitutes(method, allTypes, genericsData);
                     }
-                    catch (SkipJittingException)
+                    catch
                     {
                         return new JitResult(JitOutcome.Skip, method);
                     }
