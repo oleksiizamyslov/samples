@@ -7,7 +7,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using Microsoft.Extensions.Logging;
 
-namespace Jitting
+namespace Jitter
 {
     public class Jitter
     {
@@ -26,6 +26,8 @@ namespace Jitting
         /// <param name="logger">Optional logger to write jitting summary to</param>
         public static void RunJitting(Func<Assembly, bool> assembliesToJitFilter, ILogger? logger = null, bool throwOnError = true)
         {
+            logger?.LogInformation($"Loading assemblies into memory...");
+
             var sw = Stopwatch.StartNew();
             var initialAssemblies = AppDomain.CurrentDomain.GetAssemblies();
             var set = new HashSet<Assembly>(initialAssemblies);
@@ -36,6 +38,9 @@ namespace Jitting
             }
 
             var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            
+            logger?.LogInformation($"{assemblies.Length} assemblies loaded total.");
+
             var types = assemblies.Where(p => !p.FullName.Contains("CoreLib")).SelectMany(GetAllRelevantTypes).ToArray();
             var generics = GetGenericsData(types);
             var relevantAssemblies = assemblies.Where(assembliesToJitFilter).ToArray();
@@ -59,14 +64,6 @@ namespace Jitting
             ILogger? logger,
             bool throwOnerror)
         {
-            if (failedAssemblies.Any())
-            {
-                foreach (var asmName in failedAssemblies)
-                {
-                    logger?.LogError($"{asmName.Item2} failed to load (referenced by {asmName.Item1.FullName}).");
-                }
-            }
-
             var counts = results.GroupBy(p => p.Outcome).ToDictionary(p => p.Key, p => p.Count());
             counts.TryGetValue(JitOutcome.Fail, out var fail);
             counts.TryGetValue(JitOutcome.Success, out var success);
@@ -80,13 +77,37 @@ namespace Jitting
             {
                 logger?.LogInformation($"Jitting completed in {swElapsed.TotalSeconds} seconds! {success} methods jitted successfully, {skip} skipped");
             }
+            
+            var assemblyErrors = new StringBuilder();
+            if (failedAssemblies.Any())
+            {
+                foreach (var asmName in failedAssemblies)
+                {
+                    var error = $"{asmName.Item2} failed to load (referenced by {asmName.Item1.FullName}).";
+                    logger?.LogError(error);
+                    assemblyErrors.AppendLine(error);
+                }
+            }
 
             if ((failedAssemblies.Any() || fail > 0) && throwOnerror)
             {
-                throw new InvalidOperationException($"JIT failed for {fail} methods, {failedAssemblies.Count} assemblies failed to load.");
+                var finalErrors = new StringBuilder();
+                if (fail > 0)
+                {
+                    finalErrors.AppendLine($"JIT failed for {fail} methods, {failedAssemblies.Count} assemblies failed to load");
+                }
+
+                finalErrors.AppendLine(assemblyErrors.ToString());
+                var i = 0;
+                foreach (var error in results.Where(p => p.Outcome == JitOutcome.Fail))
+                {
+                    finalErrors.AppendLine($"{++i}. {error.MethodInfo.DeclaringType}.{error.MethodInfo.Name}: {error.Exception?.Message}");
+                }
+                throw new InvalidOperationException(finalErrors.ToString());
             }
         }
 
+        // ReSharper disable once CognitiveComplexity
         private static JitResult[] PreJitMethods(
             Assembly assembly,
             Type[] allTypes,
@@ -118,7 +139,7 @@ namespace Jitting
             if (errors.Any())
             {
                 var sb = new StringBuilder();
-                sb.AppendLine($"FAILURES IN ASSEMBLY: {assembly.GetName().Name}");
+                sb.AppendLine($"JITTING FAILURES IN ASSEMBLY: {assembly.GetName().Name}");
                 foreach (var outcome in errors.OrderBy(p => p.MethodInfo.DeclaringType!.Name).ThenBy(p => p.MethodInfo.Name))
                 {
                     sb.AppendLine($"\t{++i}. {outcome.MethodInfo.DeclaringType}.{outcome.MethodInfo.Name}: {outcome.Exception?.Message}");
@@ -292,8 +313,8 @@ namespace Jitting
                 }
 
                 var substitutes = @params.Select(p => genericMapping.ContainsKey(p)
-                                                     ? genericMapping[p]
-                                                     : new[] { p }).ToArray();
+                    ? genericMapping[p]
+                    : new[] { p }).ToArray();
                 var @base = constraintType.GetGenericTypeDefinition();
                 return CrossJoin(@base, substitutes);
             }
